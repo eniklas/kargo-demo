@@ -11,3 +11,4 @@ environments:
     bake_minutes: 0
     promotion: manual
     parallel: 5
+
