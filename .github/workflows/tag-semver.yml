@@ -1,0 +1,102 @@
+name: tag-semver
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: tag-semver
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Resolve merged PR for HEAD
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          # Use the commits/<sha>/pulls REST endpoint, not `gh pr list --search`.
+          # The search API is eventually consistent and frequently lags the push
+          # webhook by seconds-to-minutes for newly-merged PRs; this endpoint is
+          # a direct lookup against the git graph and is read-after-write
+          # consistent.
+          pr_json="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
+            --jq "[.[] | select(.merge_commit_sha == \"${sha}\")] | .[0]")"
+          if [[ -z "${pr_json}" || "${pr_json}" == "null" ]]; then
+            echo "No merged PR found for ${sha}; skipping tag." >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          number="$(jq -r '.number' <<<"${pr_json}")"
+          labels="$(jq -r '[.labels[].name] | join(",")' <<<"${pr_json}")"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "number=${number}" >> "$GITHUB_OUTPUT"
+          echo "labels=${labels}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine bump
+        id: bump
+        if: steps.pr.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          labels="${{ steps.pr.outputs.labels }}"
+          IFS=',' read -ra arr <<<"${labels}"
+          bump="patch"
+          for l in "${arr[@]}"; do
+            case "${l}" in
+              major) bump="major"; break ;;
+              minor) [[ "${bump}" != "major" ]] && bump="minor" ;;
+              patch) ;;
+            esac
+          done
+          echo "bump=${bump}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next tag
+        id: next
+        if: steps.pr.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          latest="$(git tag --list \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1 \
+            || true)"
+          if [[ -z "${latest}" ]]; then
+            major=0; minor=0; patch=0
+          else
+            IFS='.' read -r major minor patch <<<"${latest}"
+          fi
+          case "${{ steps.bump.outputs.bump }}" in
+            major) major=$((major+1)); minor=0; patch=0 ;;
+            minor) minor=$((minor+1)); patch=0 ;;
+            patch) patch=$((patch+1)) ;;
+          esac
+          tag="${major}.${minor}.${patch}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Next tag: ${tag} (bump=${{ steps.bump.outputs.bump }}, previous=${latest:-none})"
+
+      - name: Create and push tag
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG} (PR #${{ steps.pr.outputs.number }})"
+          git push origin "${TAG}"
